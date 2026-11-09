@@ -1,0 +1,30 @@
+name: Guard
+
+# This repository is only the gateway you run yourself. Fails on code or values that belong elsewhere.
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Refuse paths that do not belong here
+        run: |
+          bad=$(git ls-files | grep -E "^(worker/|dashboard/|public/|src-tauri/|migrations/|wrangler\.|render\.yaml$)|^src/core/(billing|coupons|campaigns|self-serve|hosted|issued-keys|customer-routes|admin|workspace-providers|bug-reports|partner-inquiries|cloudflare-access|aegis)" || true)
+          if [ -n "$bad" ]; then echo "$bad"; echo "::error::These paths must not be in this repository."; exit 1; fi
+      - name: Refuse private values
+        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          PRIVATE_TERMS: ${{ secrets.PRIVATE_TERMS }}
+        run: |
+          if [ -z "$PRIVATE_TERMS" ]; then echo "::error::PRIVATE_TERMS is not set."; exit 1; fi
+          printf "%s\n" "$PRIVATE_TERMS" | grep -v "^$" > "$RUNNER_TEMP/terms"
+          files=$(git grep -I -l -i -F -f "$RUNNER_TEMP/terms" -- . || true)
+          if [ -n "$files" ]; then echo "$files"; echo "::error::These files contain private values."; exit 1; fi
