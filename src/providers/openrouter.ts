@@ -1,0 +1,119 @@
+import axios from 'axios';
+import { parsePublishedPricing } from '../core/pricing';
+import { Provider, CompletionRequest, CompletionResponse, StreamChunk, ModelDetail, Capability, EmbeddingRequest, EmbeddingResult } from '../core/types';
+import { openAIEmbeddings } from '../core/media';
+import dotenv from 'dotenv';
+import { config } from '../config';
+
+dotenv.config();
+
+export class OpenRouterProvider implements Provider {
+  name = 'OpenRouter';
+  capabilities: Capability[] = ['chat', 'embeddings'];
+  defaultModel: string;
+  private apiKey: string;
+  private model: string;
+
+  constructor(apiKey: string = process.env.OPENROUTER_API_KEY || '', model: string = config.DEFAULT_MODELS.OPENROUTER) {
+    this.apiKey = apiKey;
+    this.model = model;
+    this.defaultModel = model;
+  }
+
+  async isAvailable(): Promise<boolean> {
+     return Boolean(this.apiKey);
+  }
+
+  setApiKey(apiKey: string): void {
+    this.apiKey = apiKey;
+  }
+
+  hasApiKey(): boolean {
+    return Boolean(this.apiKey);
+  }
+
+  /** OpenRouter's embedding models are vendor/name with "embed" in the name (openai/text-embedding-3-small, qwen/qwen3-embedding-8b). */
+  servesModel(capability: Capability, model: string): boolean {
+    return capability === 'embeddings' && /^[\w.-]+\/[\w.:-]*embed/i.test(model);
+  }
+
+  defaultModelFor(capability: Capability): string | undefined {
+    if (capability === 'chat') return this.defaultModel;
+    return capability === 'embeddings' ? 'openai/text-embedding-3-small' : undefined;
+  }
+
+  async embed(request: EmbeddingRequest): Promise<EmbeddingResult> {
+    return openAIEmbeddings(this.name, 'https://openrouter.ai/api/v1/embeddings', { Authorization: `Bearer ${this.apiKey}` }, request);
+  }
+
+  async getModels(): Promise<ModelDetail[]> {
+      try {
+          const response = await axios.get('https://openrouter.ai/api/v1/models');
+          return response.data.data.map((m: any) => ({
+              id: m.id,
+              name: m.name,
+              description: m.description,
+              ...(parsePublishedPricing(m.pricing) ? { pricing: parsePublishedPricing(m.pricing) } : {}),
+              ...(Array.isArray(m.architecture?.input_modalities) ? { capabilities: m.architecture.input_modalities.includes('image') ? ['chat', 'vision'] : ['chat'] } : {}),
+          }));
+      } catch (error) {
+          console.error('[OpenRouter] Failed to list models:', error);
+          return [{ id: this.defaultModel, name: 'Default OpenRouter Model' }];
+      }
+  }
+
+  async complete(request: CompletionRequest): Promise<CompletionResponse> {
+    const response = await axios.post(
+      'https://openrouter.ai/api/v1/chat/completions',
+      {
+        model: request.model || this.model,
+        messages: request.messages,
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${this.apiKey}`,
+          'Content-Type': 'application/json',
+          'HTTP-Referer': 'https://github.com/valefront/valefront', // Required by OpenRouter
+        },
+      }
+    );
+
+    return response.data;
+  }
+
+  async *completeStream(request: CompletionRequest): AsyncGenerator<StreamChunk, void, unknown> {
+    const response = await axios.post(
+        'https://openrouter.ai/api/v1/chat/completions',
+        {
+          model: request.model || this.model,
+          messages: request.messages,
+          stream: true
+        },
+        {
+          headers: {
+            'Authorization': `Bearer ${this.apiKey}`,
+            'Content-Type': 'application/json',
+            'HTTP-Referer': 'https://github.com/valefront/valefront',
+          },
+          responseType: 'stream'
+        }
+      );
+
+      const stream: any = response.data;
+
+      for await (const chunk of stream) {
+        const lines = chunk.toString().split('\n').filter((line: string) => line.trim() !== '');
+        for (const line of lines) {
+            if (line.includes('[DONE]')) return;
+            if (line.startsWith('data: ')) {
+                try {
+                const data = JSON.parse(line.replace('data: ', ''));
+                yield data;
+                } catch (e) {
+                    // ignore parse errors for partial chunks
+                }
+            }
+        }
+      }
+  }
+}

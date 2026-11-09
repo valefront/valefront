@@ -1,0 +1,346 @@
+// ── Public API exports ──────────────────────────────────────────────
+// Consumers import models and types from @valefront/valefront:
+//   import { Router, ModelRegistry, Classifier, LMStudioProvider } from '@valefront/valefront';
+export { Router, selectModelByRouter, UnsupportedContentError } from './core/router';
+export type { RouterOptions, SingleModelRouterConfig } from './core/router';
+export { ModelRegistry } from './core/model-registry';
+export { Classifier } from './core/classifier';
+export type { ClassifyFn } from './core/classifier';
+export { QuotaManager } from './core/quota-manager';
+export { ProviderRateLimiter, RateLimitExceededError } from './core/rate-limiter';
+export type {
+  ProviderRateLimit,
+  RateLimitRequest,
+  RateLimitDelayReason,
+  RateLimitDelayEvent,
+  RateLimitLease,
+  RateLimiterClock,
+  RateLimitLogger,
+} from './core/rate-limiter';
+export type {
+  Provider,
+  ApiKeyConfigurableProvider,
+  RuntimeConfigurableProvider,
+  CompletionRequest, CompletionResponse, StreamChunk, ModelDetail, Quota,
+  ModelVariant, BillingClass, ResourceClass,
+  RouterClassification, ClassifyRequest, RouteResult, RouteOptions, TierConfig,
+  Capability, EmbeddingRequest, EmbeddingResult, AudioFile, TranscriptionRequest, TranscriptionResult,
+  TranscriptSegment, TranscriptWord, SpeechRequest, SpeechResult, ChatMessage,
+} from './core/types';
+export type { ContentPart, TextPart, ImageUrlPart, InputAudioPart, FilePart } from './core/content';
+export { INSTANCE_FAMILIES } from './core/provider-instances';
+export type { InstanceFamilyDefinition, InstanceFieldSpec } from './core/provider-instances';
+export { GeminiProvider } from './providers/gemini';
+export { HuggingFaceProvider } from './providers/huggingface';
+export { OpenAIProvider } from './providers/openai';
+export { OpenRouterProvider } from './providers/openrouter';
+export { AnthropicProvider } from './providers/anthropic';
+export { OllamaProvider } from './providers/ollama';
+export { LMStudioProvider } from './providers/lmstudio';
+export { LiteLLMProvider } from './providers/litellm';
+export { LlmApiProvider } from './providers/llm-api';
+export { AzureOpenAIProvider } from './providers/azure-openai';
+export { BytePlusProvider } from './providers/byteplus';
+export { BytePlusVisionProvider } from './providers/byteplus-vision';
+export { DeepgramProvider } from './providers/deepgram';
+export { WorkersAiProvider } from './providers/workers-ai';
+export type { WorkersAiBinding } from './providers/workers-ai';
+export { CAPABILITY_PREFERENCE } from './core/router';
+export {
+  TRANSCRIPTION_USD_PER_MINUTE, SPEECH_USD_PER_MILLION_CHARS, transcriptionCostUsd, speechCostUsd,
+} from './core/media';
+export { BUILTIN_PRICES } from './core/pricing';
+export { createServer, startServer } from './server';
+export type { CreateServerOptions, StartServerOptions } from './server';
+export { config, DEFAULT_LEYLINE_CLIENT_API_KEY } from './config';
+export type { LeylineConfig, QuotaConfig, RouterModelConfig, DefaultModelsConfig, CompressionConfig, SingleModelConfig, TunnelConfig } from './config';
+export { CloudflaredTunnel, parseCloudflaredPublicUrl } from './core/cloudflared-tunnel';
+export type { TunnelInfo, TunnelState, CloudflaredTunnelOptions } from './core/cloudflared-tunnel';
+export { JanusTunnel } from './core/janus-tunnel';
+export type { JanusTunnelOptions } from './core/janus-tunnel';
+export { maybeCompress, isCompressionAvailable } from './core/compress';
+export {
+  DEFAULT_KEYCHAIN_SERVICE,
+  ArcanaFallbackSecretStore,
+  ArcanaSecretStore,
+  FallbackSecretStore,
+  KeychainSecretStore,
+  MemorySecretStore,
+  apiKeyAccount,
+  createDefaultSecretStore,
+  runtimeConfigAccount,
+  parseRuntimeConfig,
+  serializeRuntimeConfig,
+  instanceManifestAccount,
+  parseInstanceManifest,
+  serializeInstanceManifest,
+} from './core/secret-store';
+export type {
+  ApiKeyPersistenceMode, ApiKeySource, SecretStore, SecretStoreStatus, PersistedRuntimeConfig,
+  PersistedProviderInstance,
+} from './core/secret-store';
+
+// ── Internal imports (for bootstrap) ─────────────────────────────────
+import type { SecretStore } from './core/secret-store';
+import { startServer } from './server';
+import { Router } from './core/router';
+import { ModelRegistry } from './core/model-registry';
+import { Classifier } from './core/classifier';
+import { QuotaManager } from './core/quota-manager';
+import { GeminiProvider } from './providers/gemini';
+import { HuggingFaceProvider } from './providers/huggingface';
+import { OpenAIProvider } from './providers/openai';
+import { OpenRouterProvider } from './providers/openrouter';
+import { AnthropicProvider } from './providers/anthropic';
+import { OllamaProvider } from './providers/ollama';
+import { LMStudioProvider } from './providers/lmstudio';
+import { LiteLLMProvider } from './providers/litellm';
+import { LlmApiProvider } from './providers/llm-api';
+import { AzureOpenAIProvider } from './providers/azure-openai';
+import { WaveSpeedProvider } from './providers/wavespeed';
+import { BytePlusVisionProvider } from './providers/byteplus-vision';
+import { BytePlusProvider } from './providers/byteplus';
+import { DeepgramProvider } from './providers/deepgram';
+import { WorkersAiProvider, type WorkersAiBinding } from './providers/workers-ai';
+import { config, DEFAULT_LEYLINE_CLIENT_API_KEY } from './config';
+import type { ModelVariant } from './core/types';
+import { isCompressionAvailable } from './core/compress';
+import { CloudflaredTunnel } from './core/cloudflared-tunnel';
+import { JanusTunnel } from './core/janus-tunnel';
+import {
+  createDefaultSecretStore,
+  runtimeConfigAccount,
+  sanitizeEnabledModels,
+  instanceManifestAccount,
+  parseInstanceManifest,
+} from './core/secret-store';
+import { INSTANCE_FAMILIES } from './core/provider-instances';
+
+// ── Standalone server bootstrap ──────────────────────────────────────
+
+/** The router with every configured provider. `workersAi`: a Workers AI binding, so it needs no account id or token. */
+export async function buildRouter(secretStore: SecretStore, opts: { workersAi?: WorkersAiBinding } = {}): Promise<{ router: Router; quotaManager: QuotaManager }> {
+  const quotaManager = new QuotaManager();
+
+  // Configure optional Leyline-side quotas (off by default — Cursor bursts exceed low RPM caps)
+  if (config.quotas.enabled) {
+    quotaManager.setQuota('Gemini', config.quotas.gemini);
+    quotaManager.setQuota('HuggingFace', config.quotas.huggingface);
+    quotaManager.setQuota('OpenAI', config.quotas.openai);
+    quotaManager.setQuota('OpenRouter', config.quotas.openrouter);
+    quotaManager.setQuota('Ollama', config.quotas.ollama);
+    quotaManager.setQuota('AzureOpenAI', config.quotas.azureOpenAI);
+  }
+
+  // Build model registry — load custom variants if provided, else use defaults
+  let parsedCustomVariants: ModelVariant[] | undefined;
+  if (config.customVariants) {
+    try {
+      const parsed = JSON.parse(config.customVariants);
+      if (Array.isArray(parsed)) {
+        parsedCustomVariants = parsed;
+        console.log(`[Leyline] Loaded ${parsedCustomVariants.length} custom model variants`);
+      }
+    } catch (e) {
+      console.warn('[Leyline] Failed to parse LEYLINE_CUSTOM_VARIANTS, using defaults');
+    }
+  }
+  const modelRegistry = new ModelRegistry(parsedCustomVariants);
+
+  // Build classifier for the router model if configured
+  // Uses OpenAI client (already a dependency) for the lightweight router call
+  let classifier: Classifier | undefined;
+  const routerModel = config.routerModel.model;
+  const routerBaseUrl = config.routerModel.baseUrl;
+  if (!config.singleModel.enabled && routerModel && routerBaseUrl) {
+    const { default: OpenAI } = await import('openai');
+    const openai = new OpenAI({
+      baseURL: routerBaseUrl,
+      apiKey: process.env.OPENAI_API_KEY || 'not-needed',
+    });
+    classifier = new Classifier(async (system: string, userMessage: string) => {
+      const response = await openai.chat.completions.create({
+        model: routerModel,
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: userMessage },
+        ],
+        max_tokens: config.routerModel.maxTokens,
+        temperature: config.routerModel.temperature,
+        stop: ['\n\n'],
+      });
+      return response.choices[0]?.message?.content || '';
+    });
+    console.log(`[Leyline] Router classifier configured: model=${routerModel}, baseUrl=${routerBaseUrl}`);
+  }
+
+  // Optional env seed for the routing model pool, e.g.
+  // LEYLINE_ENABLED_MODELS='{"OpenAI":["gpt-5.5"],"Ollama":["llama2"]}'
+  let enabledModels: Record<string, string[]> | undefined;
+  if (process.env.LEYLINE_ENABLED_MODELS) {
+    try {
+      enabledModels = sanitizeEnabledModels(JSON.parse(process.env.LEYLINE_ENABLED_MODELS));
+    } catch {
+      console.warn('[Leyline] Failed to parse LEYLINE_ENABLED_MODELS, routing across all models');
+    }
+  }
+
+  const router = new Router({
+    quotaManager,
+    modelRegistry,
+    classifier,
+    tierConfig: config.tierModels,
+    singleModel: config.singleModel,
+    enabledModels,
+  });
+
+  if (!process.env.LLM_API_BASE_URL) {
+    const arcanaLlmApiUrl = await secretStore.get(runtimeConfigAccount('LLM API'));
+    if (arcanaLlmApiUrl) {
+      process.env.LLM_API_BASE_URL = arcanaLlmApiUrl.trim().replace(/^["']|["']$/g, '');
+    }
+  }
+
+  // Add providers in priority order
+  router.addProvider(new GeminiProvider());
+  router.addProvider(new HuggingFaceProvider());
+  router.addProvider(new OpenAIProvider());
+  router.addProvider(new OpenRouterProvider());
+  router.addProvider(new AnthropicProvider());
+  if (
+    process.env.LLM_API_BASE_URL
+    || process.env.LLM_API_DEFAULT_MODEL
+    || process.env.LLM_API_KEY
+    || process.env.LEYLINE_ARCANA_OPENAI_API_KEY_REF
+    || process.env.LEYLINE_ARCANA_OPENAI_API_URL_REF
+  ) {
+    router.addProvider(new LlmApiProvider());
+  }
+  if (process.env.LITELLM_ENABLED === 'true' || process.env.LITELLM_BASE_URL || process.env.LITELLM_MODEL) {
+    router.addProvider(new LiteLLMProvider());
+  }
+  router.addProvider(new AzureOpenAIProvider());
+  router.addProvider(new BytePlusProvider());
+  // Images (FLUX) from WaveSpeed, when its key is set (src/providers/wavespeed.ts).
+  if (process.env.WAVESPEED_API_KEY) router.addProvider(new WaveSpeedProvider());
+  // Talking avatars (OmniHuman) from BytePlus Vision AI, when its Access Key is set (src/providers/byteplus-vision.ts).
+  if (process.env.BYTEPLUS_VISION_ACCESS_KEY_ID && process.env.BYTEPLUS_VISION_SECRET_ACCESS_KEY) router.addProvider(new BytePlusVisionProvider());
+  if (process.env.OLLAMA_ENABLED === 'true') {
+    router.addProvider(new OllamaProvider());
+  }
+  // Add LMStudio provider if configured
+  if (process.env.LMSTUDIO_BASE_URL || process.env.LMSTUDIO_MODEL) {
+    router.addProvider(new LMStudioProvider());
+  }
+  // Speech-to-text (DEEPGRAM_API_KEY), and Cloudflare Workers AI (a binding, or CLOUDFLARE_ACCOUNT_ID +
+  // CLOUDFLARE_API_TOKEN): last, so chat `auto` reaches Workers AI only when nothing before it answers.
+  router.addProvider(new DeepgramProvider());
+  router.addProvider(new WorkersAiProvider({ binding: opts.workersAi }));
+
+  // Add any additional named instances (e.g. extra Azure endpoints) configured via the dashboard.
+  // These register as blank shells; startServer's initializeApiKeys() hydrates each from its own
+  // Keychain accounts, keyed by the composed instance name.
+  for (const familyDef of INSTANCE_FAMILIES) {
+    const manifestRaw = await secretStore.get(instanceManifestAccount(familyDef.family));
+    for (const instance of manifestRaw ? parseInstanceManifest(manifestRaw) : []) {
+      router.addProvider(familyDef.create({ id: instance.id, label: instance.label, ...instance.extra }));
+    }
+  }
+
+  return { router, quotaManager };
+}
+
+export async function bootstrap() {
+  const secretStore = createDefaultSecretStore();
+  const { router, quotaManager } = await buildRouter(secretStore);
+
+  const tunnel = new JanusTunnel({
+    ...config.tunnel,
+    secretStore,
+  });
+  const localUrl = `http://127.0.0.1:${config.port}`;
+
+  const app = await startServer(router, quotaManager, {
+    apiKeyStore: secretStore,
+    getTunnelInfo: () => tunnel.getInfo(),
+    host: process.env.LEYLINE_HOST || '127.0.0.1',
+  });
+
+  const shutdown = () => {
+    tunnel.stop();
+    app.close(() => process.exit(0));
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+
+  void (async () => {
+    console.log(`[Leyline] AI Router listening on port ${config.port}`);
+    console.log(`[Leyline] Local URL: ${localUrl}`);
+    console.log(`[Leyline] Max request body: ${config.bodyLimit}`);
+    if (process.env.LEYLINE_CLIENT_AUTH_ENABLED === 'false') {
+      console.warn('[Leyline] Client API auth disabled (LEYLINE_CLIENT_AUTH_ENABLED=false)');
+    } else if (process.env.LEYLINE_CLIENT_API_KEY !== undefined) {
+      console.log('[Leyline] Client API key loaded from LEYLINE_CLIENT_API_KEY');
+    } else if (config.tunnel.enabled) {
+      console.log('[Leyline] Generated random client API key for this tunnel session');
+    } else {
+      console.log('[Leyline] Client API key uses local default; set LEYLINE_CLIENT_API_KEY before exposing publicly');
+    }
+    if (config.quotas.enabled) {
+      console.log('[Leyline] Provider quotas enabled (LEYLINE_QUOTAS_ENABLED=true)');
+    } else {
+      console.log('[Leyline] Provider quotas disabled — upstream providers enforce their own rate limits');
+    }
+    if (config.singleModel.enabled) {
+      const fixedModel = (config.singleModel.model || '').trim();
+      const fixedProvider = (config.singleModel.provider || '').trim();
+      if (fixedModel) {
+        const providerLabel = fixedProvider || 'inferred from registry';
+        console.log(`[Leyline] /v1/route available (fixed model mode: ${providerLabel} / ${fixedModel})`);
+        console.log('[Leyline] Dynamic routing disabled — all requests use the fixed provider/model');
+        const normalizedFixedProvider = fixedProvider.toLowerCase().replace(/[^a-z0-9]/g, '');
+        if (!fixedProvider || normalizedFixedProvider.includes('azure')) {
+          const envBaseUrl = (process.env.AZURE_OPENAI_BASE_URL || process.env.AZURE_OPENAI_ENDPOINT || '').trim();
+          if (!envBaseUrl) {
+            console.log('[Leyline] Azure base URL comes from dashboard runtime settings or Keychain — set AZURE_OPENAI_BASE_URL in .env or save it in /dashboard');
+          }
+        }
+      } else {
+        console.warn('[Leyline] Fixed model mode enabled but LEYLINE_FIXED_MODEL is unset — /v1/route will fail until configured');
+      }
+    } else if (config.routerModel.model && config.routerModel.baseUrl) {
+      console.log(`[Leyline] /v1/route available (classifier mode: ${config.routerModel.model})`);
+    } else {
+      console.log('[Leyline] /v1/route available (tier defaults — no classifier configured)');
+      console.log('[Leyline] Classifier mode: set LEYLINE_ROUTER_MODEL and LEYLINE_OPENAI_BASE_URL');
+      console.log('[Leyline] Fixed model mode: set LEYLINE_ROUTER_ENABLED=false and LEYLINE_FIXED_MODEL');
+    }
+    if (config.compression.enabled) {
+      const available = await isCompressionAvailable();
+      if (available) {
+        console.log(`[Leyline] Prompt compression enabled via headroom-ai`);
+      } else {
+        console.warn('[Leyline] LEYLINE_COMPRESSION_ENABLED=true but headroom-ai is not installed — run: pip install headroom-ai');
+      }
+    }
+
+    if (config.tunnel.enabled) {
+      console.log(`[Leyline] Starting Janus external URL supervisor (${config.tunnel.baseUrl})...`);
+      void tunnel.start(localUrl).then((info) => {
+        if (info.state === 'ready' && info.publicUrl) {
+          console.log(`[Leyline] Public tunnel URL: ${info.publicUrl}`);
+          console.log(`[Leyline] OpenAI SDK baseURL: ${info.publicBaseUrl}`);
+          console.log(`[Leyline] Client API key: ${config.clientApiKey || DEFAULT_LEYLINE_CLIENT_API_KEY}`);
+          console.log('[Leyline] Use the public URL for cloud clients that cannot reach localhost.');
+        } else if (info.error) {
+          console.warn(`[Leyline] Janus external URL failed: ${info.error}`);
+          console.warn('[Leyline] Local-only access remains available; start Janus or set LEYLINE_TUNNEL_ENABLED=false');
+        }
+      });
+    }
+  })();
+}
+
+if (typeof module !== 'undefined' && require.main === module) {
+  void bootstrap();
+}

@@ -1,0 +1,90 @@
+import { BytePlusProvider } from '../src/providers/byteplus';
+
+describe('BytePlusProvider', () => {
+  const request = {
+    model: 'doubao-seed-1-6-251015',
+    messages: [{ role: 'user' as const, content: 'hello' }],
+  };
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it('is disabled when the API key is absent', async () => {
+    expect(await new BytePlusProvider('').isAvailable()).toBe(false);
+  });
+
+  it('only claims BytePlus ModelArk model ids', () => {
+    const provider = new BytePlusProvider('test-key');
+    expect(provider.servesModel('chat', 'deepseek-v4-1-flash-260910')).toBe(true);
+    expect(provider.servesModel('chat', 'gpt-5.6-luna')).toBe(false);
+    expect(provider.servesModel('chat', 'claude-sonnet-5-5')).toBe(false);
+    expect(provider.servesModel('embeddings', 'seed-1-6-250915')).toBe(false);
+  });
+
+  it('supports normal OpenAI-compatible replies', async () => {
+    const response = {
+      id: 'ark-1',
+      object: 'chat.completion',
+      choices: [{ index: 0, message: { role: 'assistant', content: 'hello back' }, finish_reason: 'stop' }],
+    };
+    const axios = await import('axios');
+    const postMock = jest.spyOn(axios.default, 'post').mockResolvedValue({ data: response });
+    const result = await new BytePlusProvider('test-key').complete(request);
+    expect(result).toEqual(response);
+    expect(postMock).toHaveBeenCalledWith(
+      'https://ark.ap-southeast.bytepluses.com/api/v3/chat/completions',
+      expect.objectContaining({ model: request.model, messages: request.messages, stream: false }),
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: 'Bearer test-key' }),
+      }),
+    );
+  });
+
+  it('supports streamed replies', async () => {
+    const stream = 'data: {"choices":[{"delta":{"content":"hello"}}]}\n\ndata: [DONE]\n\n';
+    jest.spyOn(global, 'fetch').mockResolvedValue(
+      new Response(stream, { status: 200, headers: { 'content-type': 'text/event-stream' } }),
+    );
+    const chunks = [];
+    for await (const chunk of new BytePlusProvider('test-key').completeStream(request)) chunks.push(chunk);
+    expect(chunks).toEqual([{ choices: [{ delta: { content: 'hello' } }] }]);
+  });
+
+  it('supports OpenAI-format tool calls', async () => {
+    const response = {
+      id: 'ark-tool',
+      choices: [{ message: { role: 'assistant', tool_calls: [{ id: 'call-1', type: 'function' }] } }],
+    };
+    const axios = await import('axios');
+    jest.spyOn(axios.default, 'post').mockResolvedValue({ data: response });
+    const result = await new BytePlusProvider('test-key').complete(request);
+    expect(result).toEqual(response);
+  });
+
+  it('generates a Seedream image', async () => {
+    const fetchMock = jest.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ data: [{ url: 'https://cdn.example/seedream.png' }], model: 'seedream-4-0-250828' }), { status: 200 }),
+    );
+    const provider = new BytePlusProvider('test-key');
+    await expect(provider.generateImage({ model: 'seedream-4-0-250828', prompt: 'a test image' })).resolves.toEqual({
+      data: [{ url: 'https://cdn.example/seedream.png' }],
+      model: 'seedream-4-0-250828',
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://ark.ap-southeast.bytepluses.com/api/v3/images/generations',
+      expect.objectContaining({ method: 'POST' }),
+    );
+  });
+
+  it('starts a Seedance task (queued) and reads it back with its tokens', async () => {
+    const fetchMock = jest.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: 'task-1' }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: 'task-1', model: 'seedance-1-0-pro-250528', status: 'succeeded', content: { video_url: 'https://cdn.example/seedance.mp4' }, usage: { completion_tokens: 246000 }, resolution: '720p', duration: 5 }), { status: 200 }));
+    const p = new BytePlusProvider('test-key');
+    await expect(p.generateVideo({ model: 'seedance-1-0-pro-250528', prompt: 'a test video' }))
+      .resolves.toMatchObject({ id: 'task-1', status: 'queued', duration: 5, resolution: '720p' });
+    expect(JSON.parse(String(fetchMock.mock.calls[0]![1]!.body))).toMatchObject({ model: 'seedance-1-0-pro-250528', duration: 5, resolution: '720p', watermark: false });
+    await expect(p.getVideo('task-1')).resolves.toMatchObject({ status: 'succeeded', url: 'https://cdn.example/seedance.mp4', tokens: 246000 });
+  });
+});
